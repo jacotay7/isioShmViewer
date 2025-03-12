@@ -81,6 +81,11 @@ def handle_client(conn, addr):
         
         # Send the image shape
         shape = shm_obj.md.size  # Assuming this returns a tuple like (1024, 1024)
+        # Collapse any axes which are 1
+        shape = tuple(dim for dim in shape if dim > 1)
+        # If there's only one axis, add a dummy axis of size 1
+        if len(shape) == 1:
+            shape = (shape[0], 1)
         conn.send(struct.pack('!II', *shape))  # Send the shape as two 4-byte integers
         
         bw_manager = BandwidthManager(10 * 1024 * 1024)  # 10 MB/s default cap
