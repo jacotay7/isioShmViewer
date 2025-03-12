@@ -23,8 +23,14 @@ class ImageStreamIO:
     def read_shm(shm_obj):
         """
         Convert the shared memory image to a NumPy array.
+        Ensures the result is a numpy array and removes any singleton dimensions.
         """
-        return np.array(shm_obj)
+        data = shm_obj.copy()
+        # Ensure it's a numpy array
+        if not isinstance(data, np.ndarray):
+            data = np.array(data)
+        # Squeeze out any dimensions that are of size 1
+        return np.squeeze(data)
 
     @staticmethod
     def get_data_size(shm_obj):

@@ -21,10 +21,11 @@ class SHMPlotWidget(QWidget):
     It connects to the server, sends the SHM name, and continuously receives
     frames (expected to be 1024x1024 float32 arrays).
     """
-    def __init__(self, parent=None, shm_name=None, server_ip=None):
+    def __init__(self, parent=None, shm_name=None, server_ip=None, custom_shape=None):
         super(SHMPlotWidget, self).__init__(parent)
         self.shm_name = shm_name if shm_name else "default_shm"
         self.server_ip = server_ip if server_ip else "127.0.0.1"
+        self.custom_shape = custom_shape
         self.latest_frame = None
 
         # Set up layout and pyqtgraph graphics widget
@@ -108,7 +109,11 @@ class SHMPlotWidget(QWidget):
                     # Convert bytes to a numpy array and reshape it using the received shape
                     frame = np.frombuffer(frame_bytes, dtype=np.float32)
                     try:
-                        frame = frame.reshape(image_shape)
+                        # Use custom shape if provided, otherwise use the shape from server
+                        if self.custom_shape:
+                            frame = frame.reshape(self.custom_shape)
+                        else:
+                            frame = frame.reshape(image_shape)
                     except Exception as e:
                         print("Error reshaping frame:", e)
                         continue
@@ -129,12 +134,13 @@ class SplitWidget(QWidget):
     A widget that can display a single SHM plot or split into two new SplitWidgets.
     When a new leaf is created, the user is prompted for an SHM name unless skip_prompt is True.
     """
-    def __init__(self, parent=None, shm_name=None, server_ip=None, skip_prompt=False):
+    def __init__(self, parent=None, shm_name=None, server_ip=None, skip_prompt=False, custom_shape=None):
         super(SplitWidget, self).__init__(parent)
         self.leaf = True   # Initially a leaf node with one plot
         self.plot_widget = None
         self.splitter = None
         self.server_ip = server_ip
+        self.custom_shape = custom_shape
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
@@ -143,7 +149,7 @@ class SplitWidget(QWidget):
             if shm_name is None:
                 self.init_leaf()
             else:
-                self.plot_widget = SHMPlotWidget(self, shm_name=shm_name, server_ip=self.server_ip)
+                self.plot_widget = SHMPlotWidget(self, shm_name=shm_name, server_ip=self.server_ip, custom_shape=self.custom_shape)
                 self.layout.addWidget(self.plot_widget)
                 main_window = self.window()
                 if hasattr(main_window, "shm_list"):
@@ -166,12 +172,31 @@ class SplitWidget(QWidget):
             if not ok or not server_ip:
                 server_ip = "127.0.0.1"
             self.server_ip = server_ip
+        
+        # Ask if user wants to specify a custom shape
+        use_custom_shape, ok = QInputDialog.getText(
+            self, 
+            "Custom Shape", 
+            "Enter custom shape (e.g., '512,512') or leave empty for default:",
+            text=""
+        )
+        
+        custom_shape = None
+        if ok and use_custom_shape:
+            try:
+                # Parse the shape string into a tuple of integers
+                shape_values = [int(x.strip()) for x in use_custom_shape.split(',')]
+                if len(shape_values) >= 2:
+                    custom_shape = tuple(shape_values)
+                    print(f"Using custom shape: {custom_shape}")
+            except ValueError:
+                print("Invalid shape format. Using default shape.")
 
         main_window = self.window()
         if hasattr(main_window, "shm_list"):
             main_window.shm_list.append(shm_name)
 
-        self.plot_widget = SHMPlotWidget(self, shm_name=shm_name, server_ip=self.server_ip)
+        self.plot_widget = SHMPlotWidget(self, shm_name=shm_name, server_ip=self.server_ip, custom_shape=custom_shape)
         self.layout.addWidget(self.plot_widget)
 
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -215,7 +240,27 @@ class SplitWidget(QWidget):
         shm_name, ok = QInputDialog.getText(self, "SHM Name", "Enter SHM name:")
         if not ok or not shm_name:
             shm_name = "default_shm"
-        child2 = SplitWidget(self.splitter, shm_name=shm_name, server_ip=self.server_ip)
+            
+        # Ask if user wants to specify a custom shape
+        use_custom_shape, ok = QInputDialog.getText(
+            self, 
+            "Custom Shape", 
+            "Enter custom shape (e.g., '512,512') or leave empty for default:",
+            text=""
+        )
+        
+        custom_shape = None
+        if ok and use_custom_shape:
+            try:
+                # Parse the shape string into a tuple of integers
+                shape_values = [int(x.strip()) for x in use_custom_shape.split(',')]
+                if len(shape_values) >= 2:
+                    custom_shape = tuple(shape_values)
+                    print(f"Using custom shape: {custom_shape}")
+            except ValueError:
+                print("Invalid shape format. Using default shape.")
+                
+        child2 = SplitWidget(self.splitter, shm_name=shm_name, server_ip=self.server_ip, custom_shape=custom_shape)
 
         # Add both children to the splitter.
         self.splitter.addWidget(child1)
