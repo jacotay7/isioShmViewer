@@ -21,11 +21,12 @@ class SHMPlotWidget(QWidget):
     It connects to the server, sends the SHM name, and continuously receives
     frames (expected to be 1024x1024 float32 arrays).
     """
-    def __init__(self, parent=None, shm_name=None, server_ip=None, custom_shape=None):
+    def __init__(self, parent=None, shm_name=None, server_ip=None, custom_shape=None, port=5123):
         super(SHMPlotWidget, self).__init__(parent)
         self.shm_name = shm_name if shm_name else "default_shm"
         self.server_ip = server_ip if server_ip else "127.0.0.1"
         self.custom_shape = custom_shape
+        self.port = port
         self.latest_frame = None
 
         # Set up layout and pyqtgraph graphics widget
@@ -36,7 +37,7 @@ class SHMPlotWidget(QWidget):
 
         # Create a PlotItem and add an ImageItem for efficient image rendering
         self.plot_item = self.graphics_widget.addPlot()
-        self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip})")
+        self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port})")
         self.plot_item.hideAxis('left')  # Hide the y-axis
         self.plot_item.hideAxis('bottom')  # Hide the x-axis
         self.image_item = pg.ImageItem()
@@ -73,7 +74,7 @@ class SHMPlotWidget(QWidget):
         """
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((self.server_ip, 5123))
+                s.connect((self.server_ip, self.port))
                 # Send the SHM name padded to 256 bytes
                 name_bytes = self.shm_name.encode()
                 name_padded = name_bytes.ljust(256, b'\x00')
@@ -134,13 +135,14 @@ class SplitWidget(QWidget):
     A widget that can display a single SHM plot or split into two new SplitWidgets.
     When a new leaf is created, the user is prompted for an SHM name unless skip_prompt is True.
     """
-    def __init__(self, parent=None, shm_name=None, server_ip=None, skip_prompt=False, custom_shape=None):
+    def __init__(self, parent=None, shm_name=None, server_ip=None, skip_prompt=False, custom_shape=None, port=5123):
         super(SplitWidget, self).__init__(parent)
         self.leaf = True   # Initially a leaf node with one plot
         self.plot_widget = None
         self.splitter = None
         self.server_ip = server_ip
         self.custom_shape = custom_shape
+        self.port = port
 
         self.layout = QVBoxLayout()
         self.setLayout(self.layout)
@@ -149,7 +151,7 @@ class SplitWidget(QWidget):
             if shm_name is None:
                 self.init_leaf()
             else:
-                self.plot_widget = SHMPlotWidget(self, shm_name=shm_name, server_ip=self.server_ip, custom_shape=self.custom_shape)
+                self.plot_widget = SHMPlotWidget(self, shm_name=shm_name, server_ip=self.server_ip, custom_shape=self.custom_shape, port=self.port)
                 self.layout.addWidget(self.plot_widget)
                 main_window = self.window()
                 if hasattr(main_window, "shm_list"):
@@ -168,10 +170,21 @@ class SplitWidget(QWidget):
             shm_name = "default_shm"
             
         if self.server_ip is None:
-            server_ip, ok = QInputDialog.getText(self, "Server IP", "Enter server IP address:", text="127.0.0.1")
-            if not ok or not server_ip:
-                server_ip = "127.0.0.1"
-            self.server_ip = server_ip
+            server_input, ok = QInputDialog.getText(self, "Server IP", "Enter server IP address (IP:PORT):", text="127.0.0.1:5123")
+            if not ok or not server_input:
+                server_input = "127.0.0.1:5123"
+                
+            # Parse server_input to get IP and port
+            if ":" in server_input:
+                self.server_ip, port_str = server_input.rsplit(":", 1)
+                try:
+                    self.port = int(port_str)
+                except ValueError:
+                    print(f"Invalid port: {port_str}. Using default port 5123.")
+                    self.port = 5123
+            else:
+                self.server_ip = server_input
+                self.port = 5123
         
         # Ask if user wants to specify a custom shape
         use_custom_shape, ok = QInputDialog.getText(
@@ -196,7 +209,7 @@ class SplitWidget(QWidget):
         if hasattr(main_window, "shm_list"):
             main_window.shm_list.append(shm_name)
 
-        self.plot_widget = SHMPlotWidget(self, shm_name=shm_name, server_ip=self.server_ip, custom_shape=custom_shape)
+        self.plot_widget = SHMPlotWidget(self, shm_name=shm_name, server_ip=self.server_ip, custom_shape=custom_shape, port=self.port)
         self.layout.addWidget(self.plot_widget)
 
         self.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -228,7 +241,7 @@ class SplitWidget(QWidget):
         self.splitter = QSplitter(orientation=orientation, parent=self)
 
         # Create the first child without prompting for a new name.
-        child1 = SplitWidget(self.splitter, server_ip=self.server_ip, skip_prompt=True)
+        child1 = SplitWidget(self.splitter, server_ip=self.server_ip, skip_prompt=True, port=self.port)
         # Transfer the existing plot widget to child1.
         child1.plot_widget = self.plot_widget
         self.plot_widget.setParent(child1)
@@ -260,7 +273,7 @@ class SplitWidget(QWidget):
             except ValueError:
                 print("Invalid shape format. Using default shape.")
                 
-        child2 = SplitWidget(self.splitter, shm_name=shm_name, server_ip=self.server_ip, custom_shape=custom_shape)
+        child2 = SplitWidget(self.splitter, shm_name=shm_name, server_ip=self.server_ip, custom_shape=custom_shape, port=self.port)
 
         # Add both children to the splitter.
         self.splitter.addWidget(child1)
@@ -284,12 +297,25 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Dynamic SHM Viewer")
         self.shm_list = []  # List to store SHM names from created plots
         
-        # Ask for server IP at startup
-        server_ip, ok = QInputDialog.getText(self, "Server IP", "Enter server IP address:", text="127.0.0.1")
-        if not ok or not server_ip:
-            server_ip = "127.0.0.1"
+        # Ask for server IP and port at startup
+        server_input, ok = QInputDialog.getText(self, "Server IP", "Enter server IP address (IP:PORT):", text="127.0.0.1:5123")
+        if not ok or not server_input:
+            server_input = "127.0.0.1:5123"
             
-        self.split_widget = SplitWidget(self, server_ip=server_ip)
+        # Parse server_input to get IP and port
+        server_ip = "127.0.0.1"
+        port = 5123
+        if ":" in server_input:
+            server_ip, port_str = server_input.rsplit(":", 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                print(f"Invalid port: {port_str}. Using default port 5123.")
+                port = 5123
+        else:
+            server_ip = server_input
+            
+        self.split_widget = SplitWidget(self, server_ip=server_ip, port=port)
         self.setCentralWidget(self.split_widget)
         self.resize(800, 600)
 
