@@ -8,6 +8,7 @@ import argparse
 import os
 import logging
 import coloredlogs  # For colored logs
+import math  # For isnan/isinf checks
 
 # Setup logger
 logger = logging.getLogger(__name__)
@@ -90,8 +91,11 @@ def handle_client(conn, addr, bw_limit_bps):
     1. Receive requested shared memory name
     2. Verify shared memory exists
     3. Stream frames with bandwidth management
+    4. Attempt to re-initialize SHM connection if data appears invalid.
     """
     logger.info(f"Starting handler for client {addr}")
+    shm_obj = None  # Initialize shm_obj to None
+    shm_name = None  # Initialize shm_name
     try:
         import ImageStreamIOWrap as ISIO
         # Set a timeout for receiving the SHM name to prevent hanging
@@ -119,9 +123,10 @@ def handle_client(conn, addr, bw_limit_bps):
                 logger.warning(f"Client {addr} disconnected before SHM existence check response.")
             return
 
+        # Initial metadata check and sending
         frame_size = ImageStreamIO.get_data_size(shm_obj)
         if frame_size == 0:
-            logger.error(f"Calculated frame size is 0 for SHM {shm_name}. Aborting client {addr}.")
+            logger.error(f"Initial calculated frame size is 0 for SHM {shm_name}. Aborting client {addr}.")
             try:
                 conn.send(struct.pack('!Q', 0))  # Indicate error or invalid size
             except (BrokenPipeError, ConnectionResetError):
@@ -130,7 +135,6 @@ def handle_client(conn, addr, bw_limit_bps):
 
         conn.send(struct.pack('!Q', frame_size))  # Send valid frame size
 
-        # Send the image shape
         shape = shm_obj.md.size
         shape = tuple(dim for dim in shape if dim > 1)
         if len(shape) == 1:
@@ -140,35 +144,86 @@ def handle_client(conn, addr, bw_limit_bps):
             logger.warning(f"SHM {shm_name} resulted in an empty shape after filtering. Using (1, 1).")
 
         if len(shape) != 2:
-            logger.error(f"Final shape {shape} for SHM {shm_name} is not 2D. Cannot send shape to client {addr}.")
-            return
-
-        conn.send(struct.pack('!II', *shape))
-        logger.debug(f"Sent shape {shape} to client {addr}")
+            logger.error(f"Initial shape {shape} for SHM {shm_name} is not 2D. Cannot send shape to client {addr}.")
+        else:
+            try:
+                conn.send(struct.pack('!II', *shape))
+                logger.debug(f"Sent initial shape {shape} to client {addr}")
+            except (BrokenPipeError, ConnectionResetError):
+                logger.warning(f"Client {addr} disconnected before initial shape could be sent.")
+                return
 
         bw_manager = BandwidthManager(bw_limit_bps)
         logger.info(f"Bandwidth limit for {addr} set to {bw_limit_bps / (1024*1024):.2f} MB/s")
 
         running = True
+        consecutive_read_failures = 0
+        max_consecutive_read_failures = 5  # Threshold to trigger re-init
 
         while running:
             try:
                 frame = ImageStreamIO.read_shm(shm_obj)
+
+                # Check for invalid frame data
+                invalid_data = False
                 if frame is None or frame.size == 0:
-                    logger.warning(f"Failed to read valid frame from SHM {shm_name} for client {addr}. Skipping frame.")
-                    time.sleep(0.01)
-                    continue
+                    logger.warning(f"Read empty frame from SHM {shm_name} for client {addr}.")
+                    invalid_data = True
+                elif np.issubdtype(frame.dtype, np.floating) and (np.isnan(frame).any() or np.isinf(frame).any()):
+                    logger.warning(f"Detected NaN/Inf in frame from SHM {shm_name} for client {addr}.")
+                    invalid_data = True
+
+                if invalid_data:
+                    consecutive_read_failures += 1
+                    logger.warning(f"Consecutive read failures/invalid data count: {consecutive_read_failures} for {addr}")
+                    if consecutive_read_failures >= max_consecutive_read_failures:
+                        logger.warning(f"Threshold reached. Attempting to re-initialize SHM '{shm_name}' for {addr}.")
+
+                        # Attempt to close the existing object
+                        try:
+                            if hasattr(shm_obj, 'close') and callable(shm_obj.close):
+                                shm_obj.close()
+                                logger.info(f"Closed potentially stale SHM object for {addr}.")
+                            else:
+                                del shm_obj
+                                logger.info(f"Deleted potentially stale SHM object reference for {addr}.")
+                                shm_obj = None
+                        except Exception as close_err:
+                            logger.error(f"Error closing SHM object for {addr}: {close_err}", exc_info=True)
+
+                        # Attempt to reopen
+                        shm_obj = ImageStreamIO.open_shm(shm_name)
+                        if not shm_obj:
+                            logger.error(f"Failed to re-open SHM {shm_name} for client {addr} after detecting issues. Terminating handler.")
+                            running = False
+                            break
+
+                        # Re-check metadata after reopening
+                        new_frame_size = ImageStreamIO.get_data_size(shm_obj)
+                        if new_frame_size == 0:
+                            logger.error(f"Re-opened SHM {shm_name} has zero size for client {addr}. Terminating handler.")
+                            running = False
+                            break
+
+                        logger.info(f"Successfully re-opened SHM {shm_name} for client {addr}. New size: {new_frame_size} bytes.")
+                        frame_size = new_frame_size
+                        consecutive_read_failures = 0
+                        continue
+
+                    else:
+                        time.sleep(0.05)
+                        continue
+
+                consecutive_read_failures = 0
 
                 serialized = frame.tobytes()
                 data_len = len(serialized)
 
                 header = struct.pack('!Q', data_len)
                 conn.sendall(header + serialized)
-                logger.debug(f"Sent frame of size {data_len} bytes to {addr}")
 
                 sleep_time = bw_manager.update(data_len)
                 if sleep_time > 0:
-                    logger.debug(f"Sleeping for {sleep_time:.4f}s to manage bandwidth for {addr}")
                     time.sleep(sleep_time)
 
                 if time.time() - bw_manager.start_time > 1:
@@ -188,6 +243,16 @@ def handle_client(conn, addr, bw_limit_bps):
     except Exception as e:
         logger.error(f"Client {addr} disconnected with error: {str(e)}", exc_info=True)
     finally:
+        if shm_obj:
+            try:
+                if hasattr(shm_obj, 'close') and callable(shm_obj.close):
+                    shm_obj.close()
+                    logger.info(f"Closed SHM object for {addr} during final cleanup.")
+                else:
+                    del shm_obj
+            except Exception as close_err:
+                logger.error(f"Error closing SHM object during final cleanup for {addr}: {close_err}")
+
         try:
             conn.close()
         except Exception as e:
