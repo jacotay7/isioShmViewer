@@ -98,9 +98,10 @@ def main():
 
     # Define shared memory names and sizes
     shms = [
-        ("test_shm_128x128", (128, 128)),
-        ("test_shm_256x256", (256, 256)),
-        ("test_shm_512x512", (512, 512))
+        ("rtc_ocam2k_descrambled_frame", (80, 80)),
+        ("rtc_xinetics_dm_controller_commands_clipped", (349, 1)),
+        ("rtc_xinetics_residual", (354, 1)),
+        ("rtc_dtt_controller_commands_clipped", (2, 1))
     ]
 
     # Create and start threads for each shared memory
