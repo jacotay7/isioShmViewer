@@ -93,6 +93,7 @@ def handle_client(conn, addr, bw_limit_bps):
     """
     logger.info(f"Starting handler for client {addr}")
     try:
+        import ImageStreamIOWrap as ISIO
         # Set a timeout for receiving the SHM name to prevent hanging
         conn.settimeout(10.0)
 
