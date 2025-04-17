@@ -159,6 +159,7 @@ def handle_client(conn, addr, bw_limit_bps):
         running = True
         consecutive_read_failures = 0
         max_consecutive_read_failures = 5  # Threshold to trigger re-init
+        invalid_data_threshold_fraction = 0.25  # Allow up to 25% NaN/Inf
 
         while running:
             try:
@@ -169,13 +170,24 @@ def handle_client(conn, addr, bw_limit_bps):
                 if frame is None or frame.size == 0:
                     logger.warning(f"Read empty frame from SHM {shm_name} for client {addr}.")
                     invalid_data = True
-                elif np.issubdtype(frame.dtype, np.floating) and (np.isnan(frame).any() or np.isinf(frame).any()):
-                    logger.warning(f"Detected NaN/Inf in frame from SHM {shm_name} for client {addr}.")
-                    invalid_data = True
+                # Check for excessive NaN/Inf
+                elif np.issubdtype(frame.dtype, np.floating):
+                    nan_count = np.isnan(frame).sum()
+                    inf_count = np.isinf(frame).sum()
+                    total_invalid_count = nan_count + inf_count
+                    threshold = frame.size * invalid_data_threshold_fraction
+
+                    if total_invalid_count > threshold:
+                        logger.warning(f"Detected {total_invalid_count} NaN/Inf values (>{threshold:.0f}, {invalid_data_threshold_fraction*100:.1f}%) in frame from SHM {shm_name} for client {addr}.")
+                        invalid_data = True
+                    elif total_invalid_count > 0:
+                        # Log if there are *some* invalid values, but below threshold
+                        logger.debug(f"Detected {total_invalid_count} NaN/Inf values (below threshold) in frame from SHM {shm_name} for client {addr}.")
+                        # Do not set invalid_data = True here, tolerate these values
 
                 if invalid_data:
                     consecutive_read_failures += 1
-                    logger.warning(f"Consecutive read failures/invalid data count: {consecutive_read_failures} for {addr}")
+                    logger.warning(f"Consecutive read failures/excessive invalid data count: {consecutive_read_failures} for {addr}")
                     if consecutive_read_failures >= max_consecutive_read_failures:
                         logger.warning(f"Threshold reached. Attempting to re-initialize SHM '{shm_name}' for {addr}.")
 
@@ -212,9 +224,10 @@ def handle_client(conn, addr, bw_limit_bps):
 
                     else:
                         time.sleep(0.05)
-                        continue
+                        continue  # Skip sending this frame deemed invalid
 
-                consecutive_read_failures = 0
+                # If we reach here, frame is considered valid enough to send
+                consecutive_read_failures = 0  # Reset counter on successful valid read
 
                 serialized = frame.tobytes()
                 data_len = len(serialized)
