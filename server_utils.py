@@ -41,7 +41,7 @@ class ServerBase:
     """
     Base class for shared memory streaming servers.
     """
-    def __init__(self, host='127.0.0.1', port=5123, max_clients=None, bw_limit_mbps=10.0):
+    def __init__(self, host='127.0.0.1', port=5123, max_clients=None, bw_limit_mbps=10.0, logger=None):
         self.host = host
         self.port = port
         self.max_clients = max_clients
@@ -49,6 +49,7 @@ class ServerBase:
         self.running = False
         self.socket = None
         self.client_threads = []
+        self.logger = logger or logging.getLogger(__name__)
         
     def start(self):
         """
@@ -61,27 +62,27 @@ class ServerBase:
             self.socket.bind((self.host, self.port))
             self.socket.listen()
             
-            logger.info(f"Server listening on {self.host}:{self.port}")
+            self.logger.info(f"Server listening on {self.host}:{self.port}")
             if self.max_clients:
-                logger.info(f"Maximum clients allowed: {self.max_clients}")
+                self.logger.info(f"Maximum clients allowed: {self.max_clients}")
             else:
-                logger.info("No client limit set.")
-            logger.info(f"Default bandwidth limit per client: {self.bw_limit_bps / (1024*1024)} MB/s")
+                self.logger.info("No client limit set.")
+            self.logger.info(f"Default bandwidth limit per client: {self.bw_limit_bps / (1024*1024)} MB/s")
 
             while self.running:
                 try:
                     # Clean up terminated threads
-                    self.client_threads = [t for t in client_threads if t.is_alive()]
+                    self.client_threads = [t for t in self.client_threads if t.is_alive()]
                     active_client_count = len(self.client_threads)
-                    logger.debug(f"Active clients: {active_client_count}")
+                    self.logger.debug(f"Active clients: {active_client_count}")
 
                     if self.max_clients is not None and active_client_count >= self.max_clients:
-                        logger.warning(f"Max client limit ({self.max_clients}) reached. Waiting for a slot...")
+                        self.logger.warning(f"Max client limit ({self.max_clients}) reached. Waiting for a slot...")
                         time.sleep(1)
                         continue
 
                     conn, addr = self.socket.accept()
-                    logger.info(f"New connection from {addr}")
+                    self.logger.info(f"New connection from {addr}")
                     client_thread = threading.Thread(
                         target=self.handle_client,
                         args=(conn, addr, self.bw_limit_bps),
@@ -91,15 +92,15 @@ class ServerBase:
                     self.client_threads.append(client_thread)
 
                 except KeyboardInterrupt:
-                    logger.info("Shutdown signal received.")
+                    self.logger.info("Shutdown signal received.")
                     self.running = False
                     break
                 except Exception as e:
-                    logger.error(f"Error accepting connection: {str(e)}", exc_info=True)
+                    self.logger.error(f"Error accepting connection: {str(e)}", exc_info=True)
                     time.sleep(1)
                     
         except Exception as e:
-            logger.critical(f"Server error: {str(e)}", exc_info=True)
+            self.logger.critical(f"Server error: {str(e)}", exc_info=True)
         finally:
             self.shutdown()
 
@@ -108,13 +109,13 @@ class ServerBase:
         Shutdown the server and clean up resources.
         """
         self.running = False
-        logger.info("Shutting down server.")
+        self.logger.info("Shutting down server.")
         
         if self.socket:
             try:
                 self.socket.close()
             except Exception as e:
-                logger.error(f"Error closing server socket: {str(e)}")
+                self.logger.error(f"Error closing server socket: {str(e)}")
     
     def handle_client(self, conn, addr, bw_limit_bps):
         """

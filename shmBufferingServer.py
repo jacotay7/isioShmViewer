@@ -130,8 +130,8 @@ class ShmBufferingServer(ServerBase):
     Server that buffers SHM data and sends contiguous blocks to clients.
     """
     def __init__(self, host='127.0.0.1', port=5124, max_clients=None, 
-                 bw_limit_mbps=10.0, buffer_size=100, poll_interval=0.01):
-        super().__init__(host, port, max_clients, bw_limit_mbps)
+                 bw_limit_mbps=10.0, buffer_size=100, poll_interval=0.01, logger=None):
+        super().__init__(host, port, max_clients, bw_limit_mbps, logger)
         self.buffers = {}  # Dictionary mapping SHM names to their frame buffers
         self.buffer_size = buffer_size
         self.poll_interval = poll_interval
@@ -538,10 +538,19 @@ if __name__ == "__main__":
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     coloredlogs.install(
         level=log_level,
-        logger=logger,
         fmt='%(asctime)s [%(levelname)s] %(name)s:%(funcName)s - %(message)s',
         level_styles={'debug': {'color': 'green'}, 'info': {'color': 'cyan'}, 'warning': {'color': 'yellow'}, 'error': {'color': 'red'}, 'critical': {'bold': True, 'color': 'red'}}
     )
+    logger = logging.getLogger("ShmBufferingServer")
+
+    # Add a fallback StreamHandler to ensure logs are printed to the console
+    if not logger.hasHandlers():
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(log_level)
+        console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s:%(funcName)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+        logger.info("Fallback StreamHandler added to logger.")
 
     if args.cores:
         try:
@@ -558,6 +567,7 @@ if __name__ == "__main__":
         max_clients=args.max_clients, 
         bw_limit_mbps=args.bw_limit,
         buffer_size=args.buffer_size,
-        poll_interval=args.poll_interval
+        poll_interval=args.poll_interval,
+        logger=logger
     )
     server.start()

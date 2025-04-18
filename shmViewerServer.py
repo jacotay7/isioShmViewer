@@ -12,13 +12,13 @@ import math  # For isnan/isinf checks
 from isio_wrapper import ImageStreamIO
 from server_utils import BandwidthManager, ServerBase, pin_to_cores, recv_all
 
-# Setup logger
-logger = logging.getLogger(__name__)
-
 class ShmStreamingServer(ServerBase):
     """
     Server that streams latest SHM data to clients.
     """
+    def __init__(self, host='127.0.0.1', port=5123, max_clients=None, bw_limit_mbps=10.0, logger=None):
+        super().__init__(host, port, max_clients, bw_limit_mbps, logger)
+
     def handle_client(self, conn, addr, bw_limit_bps):
         """
         Handle client connection:
@@ -235,13 +235,23 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Configure logger
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
     coloredlogs.install(
         level=log_level,
-        logger=logger,
         fmt='%(asctime)s [%(levelname)s] %(name)s:%(funcName)s - %(message)s',
         level_styles={'debug': {'color': 'green'}, 'info': {'color': 'cyan'}, 'warning': {'color': 'yellow'}, 'error': {'color': 'red'}, 'critical': {'bold': True, 'color': 'red'}}
     )
+    logger = logging.getLogger("ShmStreamingServer")
+
+    # Add a fallback StreamHandler to ensure logs are printed to the console
+    if not logger.hasHandlers():
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(log_level)
+        console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s:%(funcName)s - %(message)s')
+        console_handler.setFormatter(console_formatter)
+        logger.addHandler(console_handler)
+        logger.info("Fallback StreamHandler added to logger.")
 
     if args.cores:
         try:
@@ -256,6 +266,7 @@ if __name__ == "__main__":
         host=args.ip, 
         port=args.port, 
         max_clients=args.max_clients, 
-        bw_limit_mbps=args.bw_limit
+        bw_limit_mbps=args.bw_limit,
+        logger=logger
     )
     server.start()

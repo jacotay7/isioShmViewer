@@ -53,7 +53,7 @@ class SHMPlotWidget(QWidget):
         self.plot_item.addItem(self.image_item)
 
         # Create TextItems for overlay
-        text_color = (200, 200, 200)  # Light gray color for text
+        text_color = (0, 255, 0)  # Bright green color for text
         self.count_text = pg.TextItem(color=text_color, anchor=(0, 0))
         self.time_text = pg.TextItem(color=text_color, anchor=(0, 1))
         self.fps_text = pg.TextItem(color=text_color, anchor=(0, 2))

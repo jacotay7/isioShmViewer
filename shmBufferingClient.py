@@ -21,7 +21,7 @@ from PyQt5.QtWidgets import (
     QSlider,
     QGroupBox
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot, QMetaObject, Q_ARG
 import pyqtgraph as pg
 
 class SHMBufferingClient(QWidget):
@@ -33,6 +33,9 @@ class SHMBufferingClient(QWidget):
     frame_received = pyqtSignal(np.ndarray, int, float)
     buffer_info_received = pyqtSignal(int, int, int)
     connection_error = pyqtSignal(str)
+    update_plot_title = pyqtSignal(str)  # Add a new signal for updating the plot title
+    update_controls_enabled = pyqtSignal(bool)  # Add a new signal for enabling/disabling controls
+    update_buffer_text = pyqtSignal(str)  # Add a new signal for updating the buffer text
 
     def __init__(self, parent=None, shm_name=None, server_ip=None, custom_shape=None, port=5124):
         super(SHMBufferingClient, self).__init__(parent)
@@ -62,6 +65,9 @@ class SHMBufferingClient(QWidget):
         self.frame_received.connect(self.on_frame_received)
         self.buffer_info_received.connect(self.on_buffer_info_received)
         self.connection_error.connect(self.on_connection_error)
+        self.update_plot_title.connect(self.plot_item.setTitle)  # Connect the signal to setTitle
+        self.update_controls_enabled.connect(self.set_controls_enabled)  # Connect the signal to the method
+        self.update_buffer_text.connect(self.buffer_text.setText)  # Connect the signal to setText
 
         # Start connection thread
         self.connect_to_server()
@@ -241,8 +247,8 @@ class SHMBufferingClient(QWidget):
             
             # Mark as connected and start buffer info thread
             self.connected = True
-            self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Connected")
-            self.set_controls_enabled(True)
+            self.update_plot_title.emit(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Connected")
+            self.update_controls_enabled.emit(True)  # Emit signal to enable controls
             
             # Start buffer info thread
             self.buffer_info_running = True
@@ -483,11 +489,9 @@ class SHMBufferingClient(QWidget):
         self.buffer_min_frame = min_frame
         self.buffer_max_frame = max_frame
         self.buffer_size = buffer_size
+        self.update_buffer_text.emit(f"Buffer: {min_frame}-{max_frame} ({buffer_size} frames)")  # Emit signal
         
         # Update UI
-        self.buffer_text.setText(f"Buffer: {min_frame}-{max_frame} ({buffer_size} frames)")
-        
-        # Update controls
         self.start_frame_spin.setMinimum(min_frame)
         self.start_frame_spin.setMaximum(max_frame)
         self.end_frame_spin.setMinimum(min_frame)
@@ -500,9 +504,9 @@ class SHMBufferingClient(QWidget):
 
     def on_connection_error(self, error):
         """Handle connection errors in UI thread"""
-        self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Error: {error}")
+        self.update_plot_title.emit(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Error: {error}")
         self.connected = False
-        self.set_controls_enabled(False)
+        self.update_controls_enabled.emit(False)  # Emit signal to disable controls
         self.buffer_info_running = False
 
     def on_fetch_clicked(self):

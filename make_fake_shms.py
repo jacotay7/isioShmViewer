@@ -74,11 +74,15 @@ def randomize_img(img):
     img.write(test_frame)
     return
 
+def write_constant_img(img):
+    img.write(np.array(img))
+    return
+
 import threading
 import signal
 import sys
 
-def stream_random_data(shm_name, shape):
+def stream_random_data(shm_name, shape, sleep=0.1):
     img = create_image(shm_name, shape, np.float32)
     print(f"Streaming random data to shared memory '{shm_name}' with shape {shape}...")
     while True:
@@ -87,7 +91,7 @@ def stream_random_data(shm_name, shape):
         except Exception as e:
             print(f"Error writing to shared memory '{shm_name}':", e)
             break
-        time.sleep(0.1)
+        time.sleep(sleep)
 
 def signal_handler(sig, frame):
     print("Exiting...")
