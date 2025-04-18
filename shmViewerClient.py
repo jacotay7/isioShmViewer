@@ -14,12 +14,13 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer
 import pyqtgraph as pg
+import time  # Import time for initial prev_time
 
 class SHMPlotWidget(QWidget):
     """
     A pyqtgraph-based widget that displays a frame streamed from the server.
     It connects to the server, sends the SHM name, and continuously receives
-    frames (expected to be 1024x1024 float32 arrays).
+    frames (expected to be 1024x1024 float32 arrays). Also displays overlay text.
     """
     def __init__(self, parent=None, shm_name=None, server_ip=None, custom_shape=None, port=5123):
         super(SHMPlotWidget, self).__init__(parent)
@@ -28,6 +29,14 @@ class SHMPlotWidget(QWidget):
         self.custom_shape = custom_shape
         self.port = port
         self.latest_frame = None
+        self.latest_count = -1
+        self.latest_time = -1.0
+        self.image_shape = None  # Store the shape received from server
+
+        # State for FPS calculation
+        self.prev_count = -1
+        self.prev_time = -1.0
+        self.shm_write_fps = 0.0
 
         # Set up layout and pyqtgraph graphics widget
         self.layout = QVBoxLayout()
@@ -37,11 +46,26 @@ class SHMPlotWidget(QWidget):
 
         # Create a PlotItem and add an ImageItem for efficient image rendering
         self.plot_item = self.graphics_widget.addPlot()
-        self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port})")
+        self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Connecting...")
         self.plot_item.hideAxis('left')  # Hide the y-axis
         self.plot_item.hideAxis('bottom')  # Hide the x-axis
         self.image_item = pg.ImageItem()
         self.plot_item.addItem(self.image_item)
+
+        # Create TextItems for overlay
+        text_color = (200, 200, 200)  # Light gray color for text
+        self.count_text = pg.TextItem(color=text_color, anchor=(0, 0))
+        self.time_text = pg.TextItem(color=text_color, anchor=(0, 1))
+        self.fps_text = pg.TextItem(color=text_color, anchor=(0, 2))
+
+        self.plot_item.addItem(self.count_text)
+        self.plot_item.addItem(self.time_text)
+        self.plot_item.addItem(self.fps_text)
+
+        # Position text items (relative to view coordinates)
+        self.count_text.setPos(0, 0)  # Top-left corner
+        self.time_text.setPos(0, 1)  # Below count text
+        self.fps_text.setPos(0, 2)   # Below time text
 
         # Start the background thread to receive data from the server
         self.socket_thread = threading.Thread(target=self.receive_data, daemon=True)
@@ -69,9 +93,17 @@ class SHMPlotWidget(QWidget):
           1. Send the SHM name padded to 256 bytes.
           2. Receive an 8-byte frame size (0 indicates failure).
           3. Receive the image shape as a tuple.
-          4. In a loop, receive an 8-byte header with the length of the upcoming frame,
-             then receive the frame bytes.
+          4. In a loop:
+             a. Receive an 8-byte header with the total length of the upcoming payload
+                (count + timestamp + frame data).
+             b. Receive the payload bytes.
+             c. Unpack count (int64) and timestamp (float64) from the start of the payload.
+             d. The remaining bytes are the frame data.
         """
+        # Define struct formats for count (int64) and time (float64)
+        count_time_format = '!qd'  # Signed long long (int64), double (float64)
+        count_time_size = struct.calcsize(count_time_format)
+
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.connect((self.server_ip, self.port))
@@ -79,7 +111,7 @@ class SHMPlotWidget(QWidget):
                 name_bytes = self.shm_name.encode()
                 name_padded = name_bytes.ljust(256, b'\x00')
                 s.sendall(name_padded)
-                
+
                 # Receive initial frame size (8 bytes)
                 data = self.recv_all(s, 8)
                 if data is None:
@@ -89,46 +121,126 @@ class SHMPlotWidget(QWidget):
                 if expected_frame_size == 0:
                     print("Invalid SHM name. No shared memory found on server.")
                     return
-                
+
                 # Receive the image shape (e.g., 2 integers for 2D shape)
                 shape_data = self.recv_all(s, 8)  # Assuming shape is sent as two 4-byte integers
                 if shape_data is None:
                     print("Failed to receive image shape from server.")
                     return
-                image_shape = struct.unpack('!II', shape_data)  # Adjust based on actual shape format
-                
+                self.image_shape = struct.unpack('!II', shape_data)  # Store the shape
+
                 # Now continuously receive frames
                 while True:
-                    # Receive header: 8 bytes indicating the length of the frame
+                    # Receive header: 8 bytes indicating the total length of the payload
                     header = self.recv_all(s, 8)
                     if header is None:
                         break
-                    frame_length = struct.unpack('!Q', header)[0]
-                    frame_bytes = self.recv_all(s, frame_length)
-                    if frame_bytes is None:
+                    total_payload_length = struct.unpack('!Q', header)[0]
+
+                    if total_payload_length < count_time_size:
+                        print(f"Warning: Received payload length {total_payload_length} is smaller than count+time size {count_time_size}. Skipping.")
+                        _ = self.recv_all(s, total_payload_length)  # Try to read and discard
+                        continue
+
+                    payload_bytes = self.recv_all(s, total_payload_length)
+                    if payload_bytes is None:
                         break
-                    # Convert bytes to a numpy array and reshape it using the received shape
+
+                    # Unpack count and time from the beginning
+                    try:
+                        frame_count, frame_time = struct.unpack(count_time_format, payload_bytes[:count_time_size])
+                    except struct.error as e:
+                        print(f"Error unpacking count/time: {e}. Payload length: {len(payload_bytes)}")
+                        continue
+
+                    # The rest is the frame data
+                    frame_bytes = payload_bytes[count_time_size:]
+                    expected_frame_byte_len = total_payload_length - count_time_size
+
+                    if len(frame_bytes) != expected_frame_byte_len:
+                        print(f"Warning: Frame data length mismatch. Expected {expected_frame_byte_len}, got {len(frame_bytes)}. Skipping frame.")
+                        continue
+
+                    # Convert bytes to a numpy array and reshape it
                     frame = np.frombuffer(frame_bytes, dtype=np.float32)
                     try:
                         # Use custom shape if provided, otherwise use the shape from server
-                        if self.custom_shape:
-                            frame = frame.reshape(self.custom_shape)
-                        else:
-                            frame = frame.reshape(image_shape)
-                    except Exception as e:
-                        print("Error reshaping frame:", e)
+                        target_shape = self.custom_shape if self.custom_shape else self.image_shape
+                        if not target_shape:
+                            print("Error: Cannot reshape frame, target shape unknown.")
+                            continue
+
+                        # Check buffer size against target shape
+                        expected_elements = np.prod(target_shape)
+                        if frame.size != expected_elements:
+                            print(f"Error: Frame buffer size mismatch. Expected {expected_elements} elements for shape {target_shape}, got {frame.size}. Skipping frame.")
+                            continue
+
+                        frame = frame.reshape(target_shape)
+
+                    except ValueError as e:
+                        print(f"Error reshaping frame: {e}. Buffer size: {frame.size}, Target shape: {target_shape}")
                         continue
+                    except Exception as e:
+                        print(f"Unexpected error processing frame: {e}")
+                        continue
+
                     self.latest_frame = frame
+                    self.latest_count = frame_count
+                    self.latest_time = frame_time
+
         except Exception as e:
             print(f"Error in SHM socket thread connecting to {self.server_ip}:", e)
+            # Update title to show error state
+            self.latest_frame = None  # Clear frame on error
+            self.latest_count = -1
+            self.latest_time = -1.0
+            # Schedule title update from main thread
+            self.timer.singleShot(0, lambda: self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Error: {e}"))
 
     def update_plot(self):
         """
-        Update the pyqtgraph ImageItem with the latest received frame.
+        Update the pyqtgraph ImageItem with the latest received frame
+        and update the title and overlay text with count, time, and FPS.
         """
         if self.latest_frame is not None:
-            # The autoLevels=True flag adjusts the contrast automatically.
+            # Update image
             self.image_item.setImage(self.latest_frame, autoLevels=True)
+
+            # Calculate FPS based on SHM write times/counts
+            if self.prev_time > 0 and self.latest_time > self.prev_time and self.latest_count > self.prev_count:
+                dt = self.latest_time - self.prev_time
+                d_count = self.latest_count - self.prev_count
+                if dt > 0:
+                    self.shm_write_fps = d_count / dt
+                else:
+                    # Avoid division by zero if timestamps are identical (unlikely but possible)
+                    self.shm_write_fps = 0.0
+            elif self.prev_time < 0:
+                # First valid frame received, initialize prev_time/count
+                pass  # FPS will be 0 until the next frame
+
+            # Update previous values for next calculation
+            self.prev_count = self.latest_count
+            self.prev_time = self.latest_time
+
+            # Update title (optional, could remove if overlays are sufficient)
+            title = f"SHM: {self.shm_name} ({self.server_ip}:{self.port})"
+            self.plot_item.setTitle(title)
+
+            # Update overlay text items
+            self.count_text.setText(f"Cnt: {self.latest_count}")
+            self.time_text.setText(f"Time: {self.latest_time:.3f}")
+            self.fps_text.setText(f"SHM FPS: {self.shm_write_fps:.2f}")
+
+        else:
+            # Handle case where frame is None (e.g., error or not yet received)
+            self.count_text.setText("Cnt: N/A")
+            self.time_text.setText("Time: N/A")
+            self.fps_text.setText("SHM FPS: N/A")
+            # Keep the error title if it was set
+            if "Error" not in self.plot_item.titleLabel.text:
+                self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Waiting...")
 
 class SplitWidget(QWidget):
     """
