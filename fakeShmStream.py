@@ -153,7 +153,7 @@ def main():
     mode = "constant"
     data = None  # Replace with a NumPy array if mode is "loop"
 
-    streamer = FakeShmStreamer(mode=mode, data=data, rate=1000)
+    streamer = FakeShmStreamer(mode=mode, data=data, rate=500)
     streamer.start_streams(shms)
     streamer.wait_for_threads()
 

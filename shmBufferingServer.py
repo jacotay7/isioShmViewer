@@ -180,13 +180,21 @@ class ShmBufferingServer(ServerBase):
                             logger.warning(f"Too many failures, attempting to reopen SHM: {shm_name}")
                             shm_obj = None  # Force reopening in next iteration
                             consecutive_failures = 0
-                        time.sleep(self.poll_interval)
+                        if self.poll_interval > 0:
+                            time.sleep(self.poll_interval)
+                        else:
+                            time.sleep(0.000001)  # Minimal sleep to yield CPU if needed
                         continue
                     
                     # Reset failure counter on success
                     consecutive_failures = 0
                     
-                    # Check if this is a new frame
+                    # Check for actual frame count discontinuity (gaps or unexpected jumps)
+                    # Ignore the case where frame_count == last_frame_count (reading the same frame again)
+                    if last_frame_count is not None and frame_count != last_frame_count and frame_count != last_frame_count + 1:
+                        logger.debug(f"Frame count discontinuity detected in {shm_name}: last={last_frame_count}, current={frame_count}")
+
+                    # Check if this is a genuinely new frame (count is greater than the last one seen)
                     if last_frame_count is None or frame_count > last_frame_count:
                         # Convert datetime to timestamp
                         timestamp = frame_time.timestamp()
@@ -196,12 +204,13 @@ class ShmBufferingServer(ServerBase):
                         last_frame_count = frame_count
                         
                         # Debug logging
-                        if frame_count % 100 == 0:  # Log every 100 frames to avoid spamming
+                        if frame_count % 1000 == 0:  # Log every 100 frames to avoid spamming
                             min_count, max_count = self.buffers[shm_name].get_frame_counts()
                             logger.debug(f"Buffer for {shm_name}: size={self.buffers[shm_name].get_size()}, frames={min_count}-{max_count}")
                     
-                    # Sleep before next read
-                    time.sleep(self.poll_interval)
+                    # Sleep only if a positive poll interval is set
+                    if self.poll_interval > 0:
+                        time.sleep(self.poll_interval)
                     
                 except Exception as e:
                     logger.error(f"Error monitoring SHM {shm_name}: {str(e)}", exc_info=True)
@@ -210,7 +219,10 @@ class ShmBufferingServer(ServerBase):
                         logger.warning(f"Too many errors, attempting to reopen SHM: {shm_name}")
                         shm_obj = None  # Force reopening in next iteration
                         consecutive_failures = 0
-                    time.sleep(self.poll_interval)
+                    if self.poll_interval > 0:
+                        time.sleep(self.poll_interval)
+                    else:
+                        time.sleep(0.001)  # Slightly longer sleep on error in high-perf mode
                     
         finally:
             # Clean up
@@ -528,7 +540,7 @@ if __name__ == "__main__":
     parser.add_argument('--buffer-size', type=int, default=100,
                         help='Maximum number of frames to buffer per SHM (default: 100)')
     parser.add_argument('--poll-interval', type=float, default=0.01,
-                        help='Interval between SHM polls in seconds (default: 0.01)')
+                        help='Interval between SHM polls in seconds. Set to 0 or less to poll as fast as possible (high performance mode). (default: 0.01)')
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set the logging level (default: INFO)')

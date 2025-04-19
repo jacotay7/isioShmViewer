@@ -183,14 +183,35 @@ class SHMStream:
                 break
 
     def _buffer_poll_thread(self):
-        """Thread for continuously polling the latest N frames from a buffer server."""
+        """Thread for continuously polling frames from a buffer server to fill the local buffer."""
         while self.connected:
             try:
-                # Request the latest N frames, where N is our local buffer size limit
-                success = self.request_latest_n_frames(self.max_buffer_size)
+                # Determine the next frame count needed by the client buffer
+                # If buffer is empty (buffer_max_frame is -1), start requesting from frame 0
+                next_frame_needed = self.buffer_max_frame + 1 if self.frame_counts else 0
+                
+                # Define the end frame for the request (effectively infinity for int64)
+                # The server will only send up to max_frames_per_request anyway
+                end_frame_request = (1 << 63) - 1 
+                
+                # Define how many frames to request at most in one go.
+                # Using max_buffer_size might be large, but server limits response.
+                # Alternatively, a smaller fixed chunk size (e.g., 100 or server_buffer_size) could be used.
+                # Let's use max_buffer_size for now.
+                max_frames_per_request = self.max_buffer_size 
+                
+                # Request the range of frames starting from the next needed one
+                success = self.request_frame_range(
+                    next_frame_needed, 
+                    end_frame_request, 
+                    max_frames_per_request
+                )
                 # Optional: Add logging or checks based on success status if needed
                 
                 # Wait for the specified interval before polling again
+                # If the request returned many frames, might want a shorter wait?
+                # If it returned few/none, might want a longer wait?
+                # Simple fixed interval for now.
                 time.sleep(self.poll_interval)
                 
             except Exception as e:
@@ -261,30 +282,42 @@ class SHMStream:
     
     def _add_to_buffer(self, frame, frame_count, frame_time):
         """
-        Add a frame to the buffer and maintain buffer size limit.
+        Add a frame to the buffer and maintain buffer size limit strictly.
         
         Args:
             frame: The numpy array with frame data
             frame_count: The frame counter value
             frame_time: The timestamp of the frame
         """
-        # Add to buffer dictionary
-        self.frames_buffer[frame_count] = (frame, frame_time)
+        # If frame already exists, update it (optional, could skip if performance critical)
+        if frame_count in self.frames_buffer:
+            self.frames_buffer[frame_count] = (frame, frame_time)
+            # No need to adjust frame_counts or size limit if just updating
+            return
+
+        # Ensure buffer does not exceed max size BEFORE adding
+        # Only remove if max_buffer_size is positive
+        while self.max_buffer_size > 0 and len(self.frames_buffer) >= self.max_buffer_size:
+            # Remove oldest frame if buffer is full
+            if self.frame_counts:
+                oldest_count = self.frame_counts.pop(0) # Remove from sorted list first
+                if oldest_count in self.frames_buffer:
+                    del self.frames_buffer[oldest_count] # Then remove from dictionary
+            else:
+                # Should not happen if len(self.frames_buffer) >= max_buffer_size > 0
+                # but break just in case to avoid infinite loop
+                break 
         
-        # Update ordered frame count list
-        if frame_count not in self.frame_counts:
-            # Binary search for insertion point to keep list sorted
+        # Add the new frame if buffer size allows (or if size is unlimited)
+        if self.max_buffer_size <= 0 or len(self.frames_buffer) < self.max_buffer_size:
+            # Add to buffer dictionary
+            self.frames_buffer[frame_count] = (frame, frame_time)
+            
+            # Update ordered frame count list by inserting in sorted order
             pos = self._find_insertion_point(self.frame_counts, frame_count)
             self.frame_counts.insert(pos, frame_count)
         
-        # Maintain buffer size limit
-        while len(self.frames_buffer) > self.max_buffer_size:
-            # Remove oldest frame
-            oldest_count = self.frame_counts[0]
-            del self.frames_buffer[oldest_count]
-            self.frame_counts.pop(0)
-        
-        # Update min/max frame counts
+        # Update min/max frame counts based on the current state of frame_counts
         if self.frame_counts:
             self.buffer_min_frame = self.frame_counts[0]
             self.buffer_max_frame = self.frame_counts[-1]
@@ -314,13 +347,13 @@ class SHMStream:
     
     def get_contiguous_buffer(self, start_frame=None, end_frame=None, max_frames=None):
         """
-        Create a contiguous buffer array from start_frame to end_frame.
-        Missing frames are filled with NaN values.
+        Create a contiguous buffer array potentially filling missing frames with NaN.
+        The default range spans at most max_buffer_size frames ending at the latest frame.
         
         Args:
-            start_frame: Starting frame number (default: buffer_min_frame)
+            start_frame: Starting frame number (default: calculated based on max_buffer_size)
             end_frame: Ending frame number (default: buffer_max_frame)
-            max_frames: Maximum number of frames to include (default: all frames in range)
+            max_frames: Maximum number of frames to include (overrides default range size)
             
         Returns:
             Tuple of (frames_array, counts_array, times_array) where:
@@ -328,40 +361,60 @@ class SHMStream:
                 counts_array: A 1D array of frame counts
                 times_array: A 1D array of frame timestamps
         """
-        if not self.frames_buffer:
+        if not self.frames_buffer or not self.frame_counts: # Check frame_counts too
             return None, None, None
             
-        # Set defaults
-        if start_frame is None:
-            start_frame = self.buffer_min_frame
-        if end_frame is None:
-            end_frame = self.buffer_max_frame
+        # Determine default end_frame
+        effective_end_frame = end_frame if end_frame is not None else self.buffer_max_frame
         
-        # Apply max_frames constraint if specified
-        if max_frames is not None and end_frame - start_frame + 1 > max_frames:
-            end_frame = start_frame + max_frames - 1
-            
-        # Calculate the range of frames
-        num_frames = end_frame - start_frame + 1
+        # Determine default start_frame, ensuring the default range <= max_buffer_size
+        if start_frame is None:
+            # Calculate start based on end and max buffer size, but not before the actual oldest frame
+            calculated_start = effective_end_frame - self.max_buffer_size + 1
+            effective_start_frame = max(self.buffer_min_frame, calculated_start)
+        else:
+            effective_start_frame = start_frame
+
+        # Ensure start is not after end
+        if effective_start_frame > effective_end_frame:
+             effective_start_frame = effective_end_frame # Or return empty? Return single frame for now.
+
+        # Apply max_frames constraint if specified - this limits the user's request further
+        if max_frames is not None:
+             requested_num_frames = effective_end_frame - effective_start_frame + 1
+             if requested_num_frames > max_frames:
+                 # Adjust start_frame forward if max_frames is smaller than the default/specified range
+                 effective_start_frame = effective_end_frame - max_frames + 1
+                 # Re-ensure start frame is not before the absolute minimum available
+                 effective_start_frame = max(self.buffer_min_frame, effective_start_frame)
+
+        # Calculate the final number of frames based on effective start/end
+        num_frames = effective_end_frame - effective_start_frame + 1
         if num_frames <= 0:
             return None, None, None
             
-        # Get one frame to determine shape
-        sample_frame = next(iter(self.frames_buffer.values()))[0]
+        # Get one frame to determine shape and dtype
+        # Use the latest frame for potentially better dtype/shape accuracy
+        sample_frame, _ = self.frames_buffer[self.buffer_max_frame]
         frame_shape = sample_frame.shape
+        frame_dtype = sample_frame.dtype # Use the actual dtype
         
         # Create output arrays
-        frames_array = np.full((num_frames,) + frame_shape, np.nan, dtype=np.float32)
-        counts_array = np.arange(start_frame, end_frame + 1)
+        frames_array = np.full((num_frames,) + frame_shape, np.nan, dtype=frame_dtype) # Use actual dtype
+        counts_array = np.arange(effective_start_frame, effective_end_frame + 1, dtype=np.int64) # Use int64 for counts
         times_array = np.full(num_frames, np.nan, dtype=np.float64)
         
         # Fill arrays with available data
-        for i, count in enumerate(range(start_frame, end_frame + 1)):
+        for i, count in enumerate(counts_array):
             if count in self.frames_buffer:
                 frame, timestamp = self.frames_buffer[count]
-                frames_array[i] = frame
-                times_array[i] = timestamp
-                
+                # Ensure frame shape matches before assignment (optional safety check)
+                if frame.shape == frame_shape and frame.dtype == frame_dtype:
+                     frames_array[i] = frame
+                     times_array[i] = timestamp
+                else:
+                     print(f"Warning: Frame {count} shape/dtype mismatch. Expected {frame_shape}/{frame_dtype}, got {frame.shape}/{frame.dtype}. Skipping.")
+
         return frames_array, counts_array, times_array
     
     def get_frame(self, frame_count=None):
