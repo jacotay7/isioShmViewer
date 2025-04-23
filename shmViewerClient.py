@@ -1,5 +1,4 @@
 import sys
-import socket
 import struct
 import threading
 import numpy as np
@@ -14,12 +13,13 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import Qt, QTimer
 import pyqtgraph as pg
+import time
+from shm_stream import SHMStream  # Import the new SHMStream class
 
 class SHMPlotWidget(QWidget):
     """
     A pyqtgraph-based widget that displays a frame streamed from the server.
-    It connects to the server, sends the SHM name, and continuously receives
-    frames (expected to be 1024x1024 float32 arrays).
+    It uses SHMStream to handle the connection and protocol details.
     """
     def __init__(self, parent=None, shm_name=None, server_ip=None, custom_shape=None, port=5123):
         super(SHMPlotWidget, self).__init__(parent)
@@ -27,7 +27,11 @@ class SHMPlotWidget(QWidget):
         self.server_ip = server_ip if server_ip else "127.0.0.1"
         self.custom_shape = custom_shape
         self.port = port
-        self.latest_frame = None
+        
+        # FPS calculation state
+        self.prev_count = -1
+        self.prev_time = -1.0
+        self.shm_write_fps = 0.0
 
         # Set up layout and pyqtgraph graphics widget
         self.layout = QVBoxLayout()
@@ -37,98 +41,107 @@ class SHMPlotWidget(QWidget):
 
         # Create a PlotItem and add an ImageItem for efficient image rendering
         self.plot_item = self.graphics_widget.addPlot()
-        self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port})")
+        self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Connecting...")
         self.plot_item.hideAxis('left')  # Hide the y-axis
         self.plot_item.hideAxis('bottom')  # Hide the x-axis
         self.image_item = pg.ImageItem()
         self.plot_item.addItem(self.image_item)
 
-        # Start the background thread to receive data from the server
-        self.socket_thread = threading.Thread(target=self.receive_data, daemon=True)
-        self.socket_thread.start()
+        # Create TextItems for overlay
+        text_color = (0, 255, 0)  # Bright green color for text
+        self.count_text = pg.TextItem(color=text_color, anchor=(0, 0))
+        self.time_text = pg.TextItem(color=text_color, anchor=(0, 1))
+        self.fps_text = pg.TextItem(color=text_color, anchor=(0, 2))
+
+        self.plot_item.addItem(self.count_text)
+        self.plot_item.addItem(self.time_text)
+        self.plot_item.addItem(self.fps_text)
+
+        # Position text items (relative to view coordinates)
+        self.count_text.setPos(0, 0)  # Top-left corner
+        self.time_text.setPos(0, 1)  # Below count text
+        self.fps_text.setPos(0, 2)   # Below time text
+
+        # Create SHMStream for data handling
+        self.stream = SHMStream(
+            shm_name=self.shm_name,
+            server_ip=self.server_ip,
+            port=self.port,
+            server_type=SHMStream.SERVER_TYPE_VIEWER,
+            custom_shape=self.custom_shape
+        )
+        
+        # Register callbacks for stream events
+        self.stream.register_frame_callback(self.on_frame_received)
+        self.stream.register_error_callback(self.on_connection_error)
+        
+        # Start the connection
+        self.stream.connect()
 
         # Use a QTimer to update the image periodically
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_plot)
         self.timer.start(50)  # update every 50 ms (adjust as needed)
 
-    def recv_all(self, sock, n):
-        """Helper function to receive exactly n bytes from a socket."""
-        data = b''
-        while len(data) < n:
-            packet = sock.recv(n - len(data))
-            if not packet:
-                return None
-            data += packet
-        return data
+    def on_frame_received(self, frame, count, timestamp):
+        """
+        Callback for when a new frame is received from the stream.
+        Updates the latest frame data.
+        """
+        # Calculate FPS based on SHM write times/counts
+        if self.prev_time > 0 and timestamp > self.prev_time and count > self.prev_count:
+            dt = timestamp - self.prev_time
+            d_count = count - self.prev_count
+            if dt > 0:
+                self.shm_write_fps = d_count / dt
+        
+        # Update previous values for next calculation
+        self.prev_count = count
+        self.prev_time = timestamp
+        
+        # Note: We don't update the UI directly here since we're not in the UI thread
+        # The update_plot method will handle the UI update using the latest data
 
-    def receive_data(self):
-        """
-        Connect to the server and continuously receive frames.
-        Protocol:
-          1. Send the SHM name padded to 256 bytes.
-          2. Receive an 8-byte frame size (0 indicates failure).
-          3. Receive the image shape as a tuple.
-          4. In a loop, receive an 8-byte header with the length of the upcoming frame,
-             then receive the frame bytes.
-        """
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((self.server_ip, self.port))
-                # Send the SHM name padded to 256 bytes
-                name_bytes = self.shm_name.encode()
-                name_padded = name_bytes.ljust(256, b'\x00')
-                s.sendall(name_padded)
-                
-                # Receive initial frame size (8 bytes)
-                data = self.recv_all(s, 8)
-                if data is None:
-                    print("Failed to receive frame size from server.")
-                    return
-                expected_frame_size = struct.unpack('!Q', data)[0]
-                if expected_frame_size == 0:
-                    print("Invalid SHM name. No shared memory found on server.")
-                    return
-                
-                # Receive the image shape (e.g., 2 integers for 2D shape)
-                shape_data = self.recv_all(s, 8)  # Assuming shape is sent as two 4-byte integers
-                if shape_data is None:
-                    print("Failed to receive image shape from server.")
-                    return
-                image_shape = struct.unpack('!II', shape_data)  # Adjust based on actual shape format
-                
-                # Now continuously receive frames
-                while True:
-                    # Receive header: 8 bytes indicating the length of the frame
-                    header = self.recv_all(s, 8)
-                    if header is None:
-                        break
-                    frame_length = struct.unpack('!Q', header)[0]
-                    frame_bytes = self.recv_all(s, frame_length)
-                    if frame_bytes is None:
-                        break
-                    # Convert bytes to a numpy array and reshape it using the received shape
-                    frame = np.frombuffer(frame_bytes, dtype=np.float32)
-                    try:
-                        # Use custom shape if provided, otherwise use the shape from server
-                        if self.custom_shape:
-                            frame = frame.reshape(self.custom_shape)
-                        else:
-                            frame = frame.reshape(image_shape)
-                    except Exception as e:
-                        print("Error reshaping frame:", e)
-                        continue
-                    self.latest_frame = frame
-        except Exception as e:
-            print(f"Error in SHM socket thread connecting to {self.server_ip}:", e)
+    def on_connection_error(self, error_message):
+        """Callback for connection errors"""
+        self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Error: {error_message}")
 
     def update_plot(self):
         """
-        Update the pyqtgraph ImageItem with the latest received frame.
+        Update the pyqtgraph ImageItem with the latest received frame
+        and update the title and overlay text with count, time, and FPS.
+        Called by the QTimer in the UI thread.
         """
-        if self.latest_frame is not None:
-            # The autoLevels=True flag adjusts the contrast automatically.
-            self.image_item.setImage(self.latest_frame, autoLevels=True)
+        # Get the latest frame data from the stream
+        frame, count, timestamp = self.stream.get_frame()
+        
+        if frame is not None:
+            # Update image
+            self.image_item.setImage(frame, autoLevels=True)
+
+            # Update title (optional, could remove if overlays are sufficient)
+            title = f"SHM: {self.shm_name} ({self.server_ip}:{self.port})"
+            self.plot_item.setTitle(title)
+
+            # Update overlay text items
+            self.count_text.setText(f"Cnt: {count}")
+            self.time_text.setText(f"Time: {timestamp:.3f}")
+            self.fps_text.setText(f"SHM FPS: {self.shm_write_fps:.2f}")
+
+        else:
+            # Handle case where frame is None (e.g., error or not yet received)
+            self.count_text.setText("Cnt: N/A")
+            self.time_text.setText("Time: N/A")
+            self.fps_text.setText("SHM FPS: N/A")
+            # Keep the error title if it was set
+            if "Error" not in self.plot_item.titleLabel.text:
+                self.plot_item.setTitle(f"SHM: {self.shm_name} ({self.server_ip}:{self.port}) - Waiting...")
+
+    def __del__(self):
+        """Clean up resources when the widget is destroyed"""
+        if hasattr(self, 'stream'):
+            self.stream.close()
+
 
 class SplitWidget(QWidget):
     """
@@ -288,6 +301,7 @@ class SplitWidget(QWidget):
         self.layout.addWidget(self.splitter)
         self.leaf = False
 
+
 class MainWindow(QMainWindow):
     """
     The main window holds a single SplitWidget and a list of SHM names.
@@ -319,11 +333,13 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.split_widget)
         self.resize(800, 600)
 
+
 def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
     sys.exit(app.exec_())
+
 
 if __name__ == "__main__":
     main()
