@@ -205,19 +205,27 @@ class ImageStreamIO:
     @staticmethod
     def get_shape(shm_obj):
         """
-        Get the shape of the shared memory object.
+        Get the shape of the shared memory object, removing redundant axes.
         
         Args:
             shm_obj (ISIO.Image): The shared memory image object
             
         Returns:
-            tuple: Shape of the data
+            tuple: Shape of the data with redundant axes removed
         """
         if not hasattr(shm_obj, 'md') or not hasattr(shm_obj.md, 'size') or not shm_obj.md.size:
             logger.error("SHM object metadata or size is invalid.")
             return (1, 1)
             
         shape = shm_obj.md.size
+        # Ensure shape is iterable and contains numbers
+        if not hasattr(shape, '__iter__') or not all(isinstance(dim, (int, float)) for dim in shape):
+            logger.error(f"SHM object shape is invalid: {shape}")
+            return (1, 1)
+        
+        # Remove redundant axes (dimensions of size 1)
+        shape = tuple(dim for dim in shape if dim > 1)
+        
         # Ensure at least 2D shape
         if len(shape) == 1:
             shape = (shape[0], 1)
@@ -225,4 +233,4 @@ class ImageStreamIO:
             shape = (1, 1)
             logger.warning(f"SHM resulted in an empty shape. Using (1, 1).")
             
-        return tuple(shape)
+        return shape
