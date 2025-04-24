@@ -62,7 +62,8 @@ class SHMStream:
         self.buffer_min_frame = -1
         self.buffer_max_frame = -1
         self.server_buffer_size = 0
-        
+        self.server_min_frame = 0
+        self.server_max_frame = 0
         # Latest frame info
         self.latest_frame = None
         self.latest_count = -1
@@ -127,7 +128,7 @@ class SHMStream:
                 threading.Thread(target=self._viewer_receive_thread, daemon=True).start()
             elif self.server_type == self.SERVER_TYPE_BUFFER:
                 # For buffer server, start threads for info updates and continuous polling
-                threading.Thread(target=self._buffer_info_thread, daemon=True).start()
+                # threading.Thread(target=self._buffer_info_thread, daemon=True).start()
                 threading.Thread(target=self._buffer_poll_thread, daemon=True).start()
             
         except socket.timeout:
@@ -186,43 +187,34 @@ class SHMStream:
         """Thread for continuously polling frames from a buffer server to fill the local buffer."""
         while self.connected:
             try:
-                # Determine the next frame count needed by the client buffer
-                # If buffer is empty (buffer_max_frame is -1), start requesting from frame 0
-                next_frame_needed = self.buffer_max_frame + 1 if self.frame_counts else 0
+                # First, get the latest buffer info from the server to know what range is available
+                self.request_buffer_info()
                 
-                # Define the end frame for the request (effectively infinity for int64)
-                # The server will only send up to max_frames_per_request anyway
-                end_frame_request = (1 << 63) - 1 
-                
-                # Define how many frames to request at most in one go.
-                # Using max_buffer_size might be large, but server limits response.
-                # Alternatively, a smaller fixed chunk size (e.g., 100 or server_buffer_size) could be used.
-                # Let's use max_buffer_size for now.
-                max_frames_per_request = self.max_buffer_size 
-                
-                # Request the range of frames starting from the next needed one
-                success = self.request_frame_range(
-                    next_frame_needed, 
-                    end_frame_request, 
-                    max_frames_per_request
-                )
-                # Optional: Add logging or checks based on success status if needed
+                if self.server_buffer_size > 0:
+                    # Get our current buffer min/max frame counts, if any
+                    local_min, local_max = -1, -1
+                    if self.frame_counts:
+                        local_min = self.frame_counts[0]
+                        local_max = self.frame_counts[-1]
+                    
+
+                    # Determine the range of frames to request based on server min and max frames
+                    if self.server_min_frame != -1 and self.server_max_frame != -1:
+                        frames_to_request = min(self.server_buffer_size, self.server_max_frame - self.server_min_frame + 1)
+                        self.request_latest_n_frames(frames_to_request)
                 
                 # Wait for the specified interval before polling again
-                # If the request returned many frames, might want a shorter wait?
-                # If it returned few/none, might want a longer wait?
-                # Simple fixed interval for now.
                 time.sleep(self.poll_interval)
-                
+
             except Exception as e:
                 # Handle potential errors during polling, e.g., connection issues
                 self._handle_connection_error(f"Buffer polling error: {str(e)}")
-                break # Exit thread on error
-            
+                break  # Exit thread on error
+
             # Add a small sleep even if polling interval is very short to prevent busy-waiting
             if self.poll_interval <= 0:
-                time.sleep(0.01) 
-    
+                time.sleep(0.01)
+
     def recv_all(self, sock, n):
         """Helper function to receive exactly n bytes from a socket."""
         data = b''
@@ -393,11 +385,14 @@ class SHMStream:
         if num_frames <= 0:
             return None, None, None
             
-        # Get one frame to determine shape and dtype
-        # Use the latest frame for potentially better dtype/shape accuracy
-        sample_frame, _ = self.frames_buffer[self.buffer_max_frame]
-        frame_shape = sample_frame.shape
-        frame_dtype = sample_frame.dtype # Use the actual dtype
+        # Use the known shape and dtype
+        if not self.image_shape:
+             # Should not happen if connected, but handle defensively
+             print("Warning: Image shape not known in get_contiguous_buffer.")
+             return None, None, None
+             
+        frame_shape = self.image_shape
+        frame_dtype = np.float32 # Assuming float32 based on _process_frame_data
         
         # Create output arrays
         frames_array = np.full((num_frames,) + frame_shape, np.nan, dtype=frame_dtype) # Use actual dtype
@@ -414,6 +409,7 @@ class SHMStream:
                      times_array[i] = timestamp
                 else:
                      print(f"Warning: Frame {count} shape/dtype mismatch. Expected {frame_shape}/{frame_dtype}, got {frame.shape}/{frame.dtype}. Skipping.")
+            # Otherwise, the default np.nan values remain for missing frames
 
         return frames_array, counts_array, times_array
     
@@ -526,7 +522,7 @@ class SHMStream:
             return False
             
         # Ensure n is at least 1
-        n = max(1, n) 
+        n = max(1, n)
             
         try:
             with self.socket_lock:
@@ -546,12 +542,15 @@ class SHMStream:
                     # No frames available
                     return False
                 
-                # Receive all frames
+                # Receive all frames in batch
+                # Instead of calling _receive_buffer_frame() in a loop,
+                # we'll process all the incoming data in one continuous stream
                 for _ in range(frame_count):
+                    # Each frame still has its own header + metadata + data
                     self._receive_buffer_frame()
                     
                 return True
-                    
+                
         except Exception as e:
             self._handle_connection_error(f"Error requesting latest N frames: {str(e)}")
             return False
@@ -581,7 +580,8 @@ class SHMStream:
                 # -1 indicates invalid/empty buffer
                 if min_frame != -1 and max_frame != -1:
                     self.server_buffer_size = buffer_size
-                    
+                    self.server_min_frame = min_frame
+                    self.server_max_frame = max_frame
                     # Call callback if set
                     if self.on_buffer_info_callback:
                         self.on_buffer_info_callback(min_frame, max_frame, buffer_size)

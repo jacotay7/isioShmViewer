@@ -22,10 +22,9 @@ class FrameBuffer:
     A buffer that stores frames from shared memory with their metadata.
     Keeps track of frame counts and timestamps for data consistency.
     """
-    def __init__(self, max_frames=100):
+    def __init__(self, max_frames=1000):  # Increased from 100 to 1000
         self.max_frames = max_frames
         self.buffer = collections.deque(maxlen=max_frames)
-        self.frame_count_to_index = {}  # Maps frame counts to buffer indices
         self.last_frame_count = None
         self.lock = threading.Lock()
     
@@ -42,17 +41,8 @@ class FrameBuffer:
             # Add frame to buffer
             self.buffer.append((frame.copy(), frame_count, timestamp))
             
-            # Update the mapping - note that buffer indices change when items are removed
-            self._update_index_mapping()
-            
             # Update the last frame count
             self.last_frame_count = frame_count
-    
-    def _update_index_mapping(self):
-        """Update the mapping of frame counts to buffer indices."""
-        self.frame_count_to_index.clear()
-        for idx, (_, frame_count, _) in enumerate(self.buffer):
-            self.frame_count_to_index[frame_count] = idx
     
     def get_frame_range(self, start_frame, end_frame=None, max_frames=None):
         """
@@ -76,7 +66,9 @@ class FrameBuffer:
             
             # Find frames within the specified range
             result = []
-            for frame, count, timestamp in self.buffer:
+            # Sort the buffer by frame count to ensure ordered results
+            sorted_buffer = sorted(list(self.buffer), key=lambda item: item[1])
+            for frame, count, timestamp in sorted_buffer:
                 if start_frame <= count <= end_frame:
                     result.append((frame, count, timestamp))
                     
@@ -97,8 +89,10 @@ class FrameBuffer:
             list: List of (frame, count, timestamp) tuples
         """
         with self.lock:
-            count = min(num_frames, len(self.buffer))
-            return list(self.buffer)[-count:]
+            # Sort buffer by frame count to ensure we get the truly newest frames
+            sorted_buffer = sorted(list(self.buffer), key=lambda item: item[1])
+            count = min(num_frames, len(sorted_buffer))
+            return sorted_buffer[-count:]
     
     def get_frame_counts(self):
         """
@@ -130,13 +124,14 @@ class ShmBufferingServer(ServerBase):
     Server that buffers SHM data and sends contiguous blocks to clients.
     """
     def __init__(self, host='127.0.0.1', port=5124, max_clients=None, 
-                 bw_limit_mbps=10.0, buffer_size=100, poll_interval=0.01, logger=None):
+                 bw_limit_mbps=100.0, buffer_size=1000, poll_interval=0.001, logger=None):  # Increased bandwidth and buffer size, reduced poll interval
         super().__init__(host, port, max_clients, bw_limit_mbps, logger)
         self.buffers = {}  # Dictionary mapping SHM names to their frame buffers
         self.buffer_size = buffer_size
         self.poll_interval = poll_interval
         self.monitors = {}  # Dictionary mapping SHM names to their monitor threads
         self.monitor_lock = threading.Lock()
+        self.ref_counts = {}  # Dictionary to track how many clients are using each SHM
     
     def _monitor_shm(self, shm_name):
         """
@@ -159,6 +154,12 @@ class ShmBufferingServer(ServerBase):
         
         try:
             while self.running:
+                # Check if any clients are still using this SHM
+                with self.monitor_lock:
+                    if shm_name in self.ref_counts and self.ref_counts[shm_name] <= 0:
+                        logger.info(f"No more clients using SHM {shm_name}, stopping monitor")
+                        break
+
                 try:
                     # (Re)open SHM if needed
                     if shm_obj is None:
@@ -204,9 +205,10 @@ class ShmBufferingServer(ServerBase):
                         last_frame_count = frame_count
                         
                         # Debug logging
-                        if frame_count % 1000 == 0:  # Log every 100 frames to avoid spamming
+                        if frame_count % 1000 == 0:  # Log every 1000 frames to avoid spamming
                             min_count, max_count = self.buffers[shm_name].get_frame_counts()
-                            logger.debug(f"Buffer for {shm_name}: size={self.buffers[shm_name].get_size()}, frames={min_count}-{max_count}")
+                            buffer_size = self.buffers[shm_name].get_size()
+                            logger.debug(f"Buffer for {shm_name}: size={buffer_size}, frames={min_count}-{max_count}")
                     
                     # Sleep only if a positive poll interval is set
                     if self.poll_interval > 0:
@@ -234,13 +236,14 @@ class ShmBufferingServer(ServerBase):
                 except Exception as e:
                     logger.error(f"Error closing SHM {shm_name}: {str(e)}")
             
-            # Remove buffer if server is shutting down
-            if not self.running:
-                with self.monitor_lock:
-                    if shm_name in self.buffers:
-                        del self.buffers[shm_name]
-                    if shm_name in self.monitors:
-                        del self.monitors[shm_name]
+            # Remove buffer and monitor references when finished
+            with self.monitor_lock:
+                if shm_name in self.buffers:
+                    del self.buffers[shm_name]
+                if shm_name in self.monitors:
+                    del self.monitors[shm_name]
+                if shm_name in self.ref_counts:
+                    del self.ref_counts[shm_name]
                 logger.info(f"Monitor for SHM {shm_name} stopped and resources cleaned up")
     
     def _ensure_monitor_running(self, shm_name):
@@ -254,6 +257,14 @@ class ShmBufferingServer(ServerBase):
             bool: True if monitor is (now) running, False otherwise
         """
         with self.monitor_lock:
+            # Initialize or increment reference count
+            if shm_name not in self.ref_counts:
+                self.ref_counts[shm_name] = 1
+            else:
+                self.ref_counts[shm_name] += 1
+                
+            logger.debug(f"Client subscribed to SHM {shm_name}. Reference count: {self.ref_counts[shm_name]}")
+            
             # Check if monitor already exists
             if shm_name in self.monitors and self.monitors[shm_name].is_alive():
                 return True
@@ -267,6 +278,19 @@ class ShmBufferingServer(ServerBase):
             self.monitors[shm_name] = monitor
             monitor.start()
             return True
+            
+    def _release_shm(self, shm_name):
+        """
+        Decrease the reference count for a shared memory monitor.
+        If count reaches zero, the monitor will stop on its next iteration.
+        
+        Args:
+            shm_name (str): Name of the shared memory monitor to release
+        """
+        with self.monitor_lock:
+            if shm_name in self.ref_counts:
+                self.ref_counts[shm_name] = max(0, self.ref_counts[shm_name] - 1)
+                logger.debug(f"Client unsubscribed from SHM {shm_name}. Reference count: {self.ref_counts[shm_name]}")
     
     def handle_client(self, conn, addr, bw_limit_bps):
         """
@@ -278,6 +302,8 @@ class ShmBufferingServer(ServerBase):
             bw_limit_bps (float): Bandwidth limit in bytes per second
         """
         logger.info(f"Starting buffering handler for client {addr}")
+        
+        shm_name = None  # Track SHM name for cleanup
         
         try:
             # Set a timeout for receiving the initial handshake
@@ -428,6 +454,9 @@ class ShmBufferingServer(ServerBase):
                         num_frames = len(frames)
                         conn.send(struct.pack('!Q', num_frames))
                         
+                        if num_frames > 0:
+                            logger.debug(f"Sending frame range {frames[0][1]}-{frames[-1][1]} ({num_frames} frames)")
+                        
                         # Send each frame
                         for frame, count, timestamp in frames:
                             last_sent_frame = count
@@ -465,27 +494,36 @@ class ShmBufferingServer(ServerBase):
                         num_frames = len(frames)
                         conn.send(struct.pack('!Q', num_frames))
                         
-                        # Send each frame
-                        for frame, count, timestamp in frames:
-                            last_sent_frame = count
+                        if num_frames > 0:
+                            logger.debug(f"Sending latest {num_frames} frames (requested {num_requested}), frame range: {frames[0][1]}-{frames[-1][1]}")
+                        
+                            # OPTIMIZED VERSION: Batch all frames into a single response
+                            # Each frame still needs its own metadata, but we'll send everything at once
+                            all_data = bytearray()
+                            total_bytes = 0
                             
-                            serialized_frame = frame.tobytes()
-                            frame_data_len = len(serialized_frame)
+                            # Build the complete payload for all frames
+                            for frame, count, timestamp in frames:
+                                serialized_frame = frame.tobytes()
+                                frame_data_len = len(serialized_frame)
+                                
+                                # Pack header and metadata for this frame
+                                packed_count_time = struct.pack(count_time_format, count, timestamp)
+                                total_payload_len = count_time_size + frame_data_len
+                                header = struct.pack('!Q', total_payload_len)
+                                
+                                # Add this frame's data to the combined payload
+                                all_data.extend(header + packed_count_time + serialized_frame)
+                                total_bytes += 8 + total_payload_len
                             
-                            # Pack header for this frame
-                            packed_count_time = struct.pack(count_time_format, count, timestamp)
-                            total_payload_len = count_time_size + frame_data_len
-                            header = struct.pack('!Q', total_payload_len)
+                            # Send all frames in one operation
+                            conn.sendall(all_data)
                             
-                            # Send header + count/time + frame
-                            conn.sendall(header + packed_count_time + serialized_frame)
-                            
-                            # Update bandwidth manager
-                            bytes_sent = 8 + total_payload_len
-                            sleep_time = bw_manager.update(bytes_sent)
+                            # Update bandwidth manager once for the entire batch
+                            sleep_time = bw_manager.update(total_bytes)
                             if sleep_time > 0:
                                 time.sleep(sleep_time)
-                    
+                        
                     elif cmd == 4:  # Get buffer info
                         min_count, max_count = buffer.get_frame_counts()
                         buffer_size = buffer.get_size()
@@ -496,6 +534,7 @@ class ShmBufferingServer(ServerBase):
                                               max_count if max_count is not None else -1, 
                                               buffer_size)
                         conn.send(info_data)
+                        logger.debug(f"Sent buffer info: min={min_count}, max={max_count}, size={buffer_size}")
                     
                     else:
                         logger.warning(f"Client {addr} sent unknown command: {cmd}")
@@ -518,6 +557,10 @@ class ShmBufferingServer(ServerBase):
         except Exception as e:
             logger.error(f"Unexpected error with client {addr}: {str(e)}", exc_info=True)
         finally:
+            # Release the SHM reference
+            if shm_name:
+                self._release_shm(shm_name)
+                
             try:
                 conn.close()
             except Exception:
@@ -533,14 +576,14 @@ if __name__ == "__main__":
                         help='Port to bind the server to (default: 5124)')
     parser.add_argument('--cores', type=str, default=None,
                         help='CPU core(s) to pin this process to (e.g., "0,1,2" or "3")')
-    parser.add_argument('--bw-limit', type=float, default=10.0,
-                        help='Maximum bandwidth per client in MB/s (default: 10.0)')
+    parser.add_argument('--bw-limit', type=float, default=100.0,
+                        help='Maximum bandwidth per client in MB/s (default: 100.0)')
     parser.add_argument('--max-clients', type=int, default=None,
                         help='Maximum number of concurrent clients (default: unlimited)')
-    parser.add_argument('--buffer-size', type=int, default=100,
-                        help='Maximum number of frames to buffer per SHM (default: 100)')
-    parser.add_argument('--poll-interval', type=float, default=0.01,
-                        help='Interval between SHM polls in seconds. Set to 0 or less to poll as fast as possible (high performance mode). (default: 0.01)')
+    parser.add_argument('--buffer-size', type=int, default=1000,
+                        help='Maximum number of frames to buffer per SHM (default: 1000)')
+    parser.add_argument('--poll-interval', type=float, default=0.001,
+                        help='Interval between SHM polls in seconds. Set to 0 or less to poll as fast as possible (high performance mode). (default: 0.001)')
     parser.add_argument('--log-level', type=str, default='INFO',
                         choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'],
                         help='Set the logging level (default: INFO)')

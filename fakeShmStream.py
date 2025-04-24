@@ -83,7 +83,7 @@ def main():
         # ("rtc_ocam2k_descrambled_frame", (80, 80)),
         ("rtc_xinetics_dm_controller_commands_clipped", (349, 1)),
         # ("rtc_xinetics_residual", (354, 1)),
-        # ("rtc_dtt_controller_commands_clipped", (2, 1))
+        ("rtc_dtt_controller_commands_clipped", (2, 1))
     ]
 
     # Example usage:
