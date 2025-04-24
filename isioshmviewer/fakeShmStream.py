@@ -80,15 +80,24 @@ def main():
 
     # Define shared memory names and sizes
     shms = [
-        # ("rtc_ocam2k_descrambled_frame", (80, 80)),
+        ("rtc_ocam2k_descrambled_frame", (160, 160)),
+        ("rtc_ocam2k_raw_slopes", (2432, 1)),
+        ("rtc_utt1_controller_commands", (2, 1)),
+        ("rtc_utt2_controller_commands", (2, 1)),
+        ("rtc_utt3_controller_commands", (2, 1)),
+        ("rtc_utt4_controller_commands", (2, 1)),
+        ("rtc_utt1_offset_residuals", (2, 1)),
+        ("rtc_utt2_offset_residuals", (2, 1)),
+        ("rtc_utt3_offset_residuals", (2, 1)),
+        ("rtc_utt4_offset_residuals", (2, 1)),
+        ("rtc_ocam2k_descrambled_frame", (160, 160)),
         ("rtc_xinetics_dm_controller_commands_clipped", (349, 1)),
-        # ("rtc_xinetics_residual", (354, 1)),
+        ("rtc_xinetics_residual", (354, 1)),
         ("rtc_dtt_controller_commands_clipped", (2, 1))
     ]
-
     # Example usage:
     # mode = "random" for random data, "constant" for constant data, or "loop" for looping through a NumPy array
-    mode = "constant"
+    mode = "random"
     data = None  # Replace with a NumPy array if mode is "loop"
 
     streamer = FakeShmStreamer(mode=mode, data=data, rate=500)
