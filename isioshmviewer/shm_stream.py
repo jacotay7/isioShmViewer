@@ -4,6 +4,7 @@ import struct
 import threading
 import numpy as np
 import time
+import logging
 
 class SHMStream:
     """
@@ -20,7 +21,7 @@ class SHMStream:
     
     def __init__(self, shm_name, server_ip="127.0.0.1", port=5123, 
                  server_type=None, custom_shape=None, buffer_size=100,
-                 poll_interval=0.1):
+                 poll_interval=0.1, logger=None):
         """
         Initialize a connection to a SHM stream server.
         
@@ -32,7 +33,11 @@ class SHMStream:
             custom_shape (tuple): Custom shape to reshape frames to, or None to use server shape
             buffer_size (int): Size of the local buffer to maintain (number of frames)
             poll_interval (float): Interval in seconds for polling buffer server (default 0.1)
+            logger (logging.Logger): Custom logger, or None to use the module logger
         """
+        # Set up logger
+        self.log = logger or logging.getLogger(__name__)
+        
         self.shm_name = shm_name
         self.server_ip = server_ip
         self.port = port
@@ -78,11 +83,14 @@ class SHMStream:
         self.on_buffer_info_callback = None
         self.on_connection_error_callback = None
         
+        self.log.debug(f"SHMStream initialized for '{shm_name}' at {server_ip}:{port}")
+        
     def connect(self):
         """
         Connect to the server and initialize the stream. 
         Returns True if successful, False otherwise.
         """
+        self.log.info(f"Connecting to {self.server_ip}:{self.port} for SHM '{self.shm_name}'")
         threading.Thread(target=self._connect_thread, daemon=True).start()
         return True
         
@@ -95,6 +103,7 @@ class SHMStream:
             
             # Connect
             self.socket.connect((self.server_ip, self.port))
+            self.log.debug(f"Socket connected to {self.server_ip}:{self.port}")
             
             # Send SHM name (padded to 256 bytes)
             name_bytes = self.shm_name.encode()
@@ -116,6 +125,7 @@ class SHMStream:
                 raise ConnectionError("Failed to receive image shape from server")
                 
             self.image_shape = struct.unpack('!II', shape_data)
+            self.log.info(f"Connected to SHM '{self.shm_name}' with shape {self.image_shape}")
             
             # Reset timeout for normal operation
             self.socket.settimeout(None)
@@ -125,10 +135,11 @@ class SHMStream:
             
             if self.server_type == self.SERVER_TYPE_VIEWER:
                 # For viewer server, start a background thread to continuously receive frames
+                self.log.debug("Starting viewer receive thread")
                 threading.Thread(target=self._viewer_receive_thread, daemon=True).start()
             elif self.server_type == self.SERVER_TYPE_BUFFER:
                 # For buffer server, start threads for info updates and continuous polling
-                # threading.Thread(target=self._buffer_info_thread, daemon=True).start()
+                self.log.debug("Starting buffer polling thread")
                 threading.Thread(target=self._buffer_poll_thread, daemon=True).start()
             
         except socket.timeout:
@@ -144,6 +155,7 @@ class SHMStream:
         """Handle connection errors"""
         self.connected = False
         self.connection_error = error_msg
+        self.log.error(error_msg)
         if self.on_connection_error_callback:
             self.on_connection_error_callback(error_msg)
             
@@ -159,7 +171,7 @@ class SHMStream:
                 total_payload_length = struct.unpack('!Q', header)[0]
                 
                 if total_payload_length < self.count_time_size:
-                    print(f"Warning: Payload too small: {total_payload_length} bytes")
+                    self.log.warning(f"Payload too small: {total_payload_length} bytes")
                     continue
                 
                 # Receive the payload
@@ -173,16 +185,6 @@ class SHMStream:
         except Exception as e:
             self._handle_connection_error(f"Error receiving data: {str(e)}")
     
-    def _buffer_info_thread(self):
-        """Thread for periodically updating buffer information from a buffer server"""
-        while self.connected:
-            try:
-                self.request_buffer_info()
-                time.sleep(1)  # Update every second
-            except Exception as e:
-                self._handle_connection_error(f"Buffer info error: {str(e)}")
-                break
-
     def _buffer_poll_thread(self):
         """Thread for continuously polling frames from a buffer server to fill the local buffer."""
         while self.connected:
@@ -269,8 +271,10 @@ class SHMStream:
             if self.on_frame_callback:
                 self.on_frame_callback(frame, frame_count, frame_time)
                 
+            self.log.debug(f"Processed frame {frame_count} with timestamp {frame_time:.6f}")
+                
         except Exception as e:
-            print(f"Error processing frame: {e}")
+            self.log.error(f"Error processing frame: {e}")
     
     def _add_to_buffer(self, frame, frame_count, frame_time):
         """
@@ -354,6 +358,7 @@ class SHMStream:
                 times_array: A 1D array of frame timestamps
         """
         if not self.frames_buffer or not self.frame_counts: # Check frame_counts too
+            self.log.debug("No frames in buffer when get_contiguous_buffer called")
             return None, None, None
             
         # Determine default end_frame
@@ -388,7 +393,7 @@ class SHMStream:
         # Use the known shape and dtype
         if not self.image_shape:
              # Should not happen if connected, but handle defensively
-             print("Warning: Image shape not known in get_contiguous_buffer.")
+             self.log.warning("Image shape not known in get_contiguous_buffer")
              return None, None, None
              
         frame_shape = self.image_shape
@@ -408,9 +413,10 @@ class SHMStream:
                      frames_array[i] = frame
                      times_array[i] = timestamp
                 else:
-                     print(f"Warning: Frame {count} shape/dtype mismatch. Expected {frame_shape}/{frame_dtype}, got {frame.shape}/{frame.dtype}. Skipping.")
+                     self.log.warning(f"Frame {count} shape/dtype mismatch. Expected {frame_shape}/{frame_dtype}, got {frame.shape}/{frame.dtype}. Skipping.")
             # Otherwise, the default np.nan values remain for missing frames
 
+        self.log.debug(f"Created contiguous buffer with {num_frames} frames from {effective_start_frame} to {effective_end_frame}")
         return frames_array, counts_array, times_array
     
     def get_frame(self, frame_count=None):
@@ -585,8 +591,12 @@ class SHMStream:
                     # Call callback if set
                     if self.on_buffer_info_callback:
                         self.on_buffer_info_callback(min_frame, max_frame, buffer_size)
-                        
+                    
+                    self.log.debug(f"Buffer info: min_frame={min_frame}, max_frame={max_frame}, buffer_size={buffer_size}")
                     return True
+                else:
+                    self.log.info("Buffer is empty or invalid")
+                    return False
                     
         except Exception as e:
             self._handle_connection_error(f"Error requesting buffer info: {str(e)}")
@@ -599,7 +609,7 @@ class SHMStream:
         
         Returns:
             Boolean indicating success
-        """
+        """ 
         # Receive header with payload length
         header = self.recv_all(self.socket, 8)
         if not header:
@@ -609,11 +619,13 @@ class SHMStream:
         
         # Make sure payload is at least big enough for count and time
         if total_payload_len < self.count_time_size:
+            self.log.warning(f"Invalid payload size: {total_payload_len}")
             raise ValueError(f"Invalid payload size: {total_payload_len}")
             
         # Receive the entire payload
         payload = self.recv_all(self.socket, total_payload_len)
         if not payload:
+            self.log.error("Failed to receive frame payload")
             raise ConnectionError("Failed to receive frame payload")
             
         # Process the frame
@@ -636,10 +648,11 @@ class SHMStream:
         
     def close(self):
         """Close the stream and release resources"""
+        self.log.info(f"Closing connection to {self.server_ip}:{self.port} for SHM '{self.shm_name}'")
         self.connected = False
         if self.socket:
             try:
                 self.socket.close()
-            except:
-                pass
+            except Exception as e:
+                self.log.error(f"Error closing socket: {e}")
         self.socket = None
